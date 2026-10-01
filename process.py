@@ -2,6 +2,7 @@ import os
 import re
 import json
 import subprocess
+import sys
 import shutil
 import requests
 from pathlib import Path
@@ -21,6 +22,8 @@ from rich.align import Align
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DOWNLOADS_BASE = Path("downloads")
 DOWNLOADS_BASE.mkdir(exist_ok=True)
+
+ELRC_SCRIPT = Path(__file__).resolve().parent / "SAS_to_elrc.py"
 
 console = Console()
 
@@ -43,15 +46,16 @@ class KaraokePipeline:
         self.video_id = extract_video_id(url)
         if not self.video_id:
             raise ValueError("Invalid YouTube URL")
-        
+
         self.work_dir = DOWNLOADS_BASE / self.video_id
         self.work_dir.mkdir(exist_ok=True)
-        
+
         self.status_path = self.work_dir / "status.json"
         self.metadata_path = self.work_dir / "metadata.json"
         self.audio_path = self.work_dir / "audio.mp3"
         self.lrc_path = self.work_dir / "synced.lrc"
         self.karaoke_path = self.work_dir / "karaoke.json"
+        self.elrc_path = self.work_dir / "karaoke.elrc"
         self.vocals_path = self.work_dir / "vocals.wav"
         self.instrumental_path = self.work_dir / "instrumental.wav"
 
@@ -73,9 +77,11 @@ class KaraokePipeline:
             border_style="magenta",
             title="[bold yellow]Processing Startup[/bold yellow]"
         ))
-        
+
         # 1. Check Cache
         if self.karaoke_path.exists():
+            if not self.elrc_path.exists():
+                self.elrc_step()
             console.print(Panel(
                 f"[bold green]✨ Already fully processed! Skipping. ✨[/bold green]\n"
                 f"[dim]Output files located in: [italic]{self.work_dir}[/italic][/dim]",
@@ -88,7 +94,7 @@ class KaraokePipeline:
         # 2. Download Audio & Metadata
         if not self.audio_path.exists() or not self.metadata_path.exists():
             self.download_step()
-        
+
         # 3. Fetch Lyrics
         if not self.lrc_path.exists():
             self.fetch_lyrics_step()
@@ -101,6 +107,10 @@ class KaraokePipeline:
         if not self.karaoke_path.exists():
             self.align_step()
 
+        # 6. Convert to Enhanced LRC (SAS_to_elrc.py)
+        if not self.elrc_path.exists():
+            self.elrc_step()
+
         console.print(Panel(
             Align.center("[bold green]🌟 Pipeline Successfully Completed! 🌟[/bold green]\n[cyan]All audio stems and timing data have been built and saved.[/cyan]"),
             border_style="green",
@@ -110,7 +120,7 @@ class KaraokePipeline:
 
     def download_step(self):
         self.save_status({"stage": "downloading", "progress": 0})
-        
+
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": str(self.work_dir / "audio.%(ext)s"),
@@ -124,12 +134,12 @@ class KaraokePipeline:
             "quiet": True,
             "no_warnings": True,
         }
-        
+
         with console.status("[bold cyan]📥 Downloading audio & metadata via yt-dlp...[/bold cyan]", spinner="dots") as status:
             try:
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(self.url, download=True)
-                    
+
                     # Save metadata
                     metadata = {
                         "videoId": self.video_id,
@@ -141,9 +151,9 @@ class KaraokePipeline:
                     }
                     with open(self.metadata_path, "w", encoding="utf-8") as f:
                         json.dump(metadata, f, indent=2)
-                    
+
                     self.save_status({"downloaded": True, "stage": "metadata_saved"})
-                    
+
                 console.print(Panel(
                     f"[bold green]✓ Download Completed Successfully![/bold green]\n"
                     f"[yellow]Title:[/yellow] {metadata['title']}\n"
@@ -160,16 +170,16 @@ class KaraokePipeline:
         self.save_status({"stage": "fetching_lyrics"})
         with open(self.metadata_path, "r") as f:
             meta = json.load(f)
-        
+
         search_url = "https://lrclib.net/api/search"
         params = {"q": f"{meta['title']} {meta['artist']}"}
         headers = {"User-Agent": "karaoke-sync-app/1.0"}
-        
+
         with console.status(f"[bold magenta]🔍 Fetching synced lyrics for '[italic]{meta['title']}[/italic]'...[/bold magenta]", spinner="dots") as status:
             try:
                 response = requests.get(search_url, params=params, headers=headers)
                 results = response.json()
-                
+
                 if not results:
                     console.print(Panel(
                         "[bold yellow]⚠ No lyrics found on LRCLIB.[/bold yellow]\n"
@@ -182,7 +192,7 @@ class KaraokePipeline:
 
                 # Best duration match
                 best_match = min(results, key=lambda x: abs(x.get("duration", 0) - meta["duration"]))
-                
+
                 if abs(best_match.get("duration", 0) - meta["duration"]) > 5:
                     console.print(Panel(
                         "[bold yellow]⚠ No close duration match found on LRCLIB.[/bold yellow]\n"
@@ -198,14 +208,14 @@ class KaraokePipeline:
                     with open(self.lrc_path, "w", encoding="utf-8") as f:
                         f.write(synced_lyrics)
                     self.save_status({"lyrics_found": True})
-                    
+
                     parsed_lines = self._parse_lrc(self.lrc_path)
                     preview_text = ""
                     if parsed_lines:
                         preview_items = [f"  [italic]“{line['text']}”[/italic]" for line in parsed_lines[:3] if line['text'].strip()]
                         if preview_items:
                             preview_text = "\n\n[yellow]Lyrics Preview:[/yellow]\n" + "\n".join(preview_items)
-                    
+
                     console.print(Panel(
                         f"[bold green]✓ Lyrics Fetched & Synced![/bold green]\n"
                         f"[dim]Saved synced lyrics (.lrc) successfully.[/dim]{preview_text}",
@@ -219,32 +229,32 @@ class KaraokePipeline:
                         title="[bold yellow]Step 2: No Synced Lyrics[/bold yellow]"
                     ))
                     self.save_status({"lyrics_found": False})
-                    
+
             except Exception as e:
                 console.print(f"[bold red]✗ Lyrics search failed: {e}[/bold red]")
                 self.save_status({"lyrics_found": False})
 
     def separate_step(self):
         self.save_status({"stage": "separating_vocals"})
-        
+
         console.print(Panel(
             "[bold yellow]⚡ Splitting Audio into Vocals & Instrumentals (Demucs)...[/bold yellow]\n"
             "[dim]Running Demucs high-quality stem separation. This uses heavy AI computation.[/dim]",
             border_style="yellow",
             title="[bold yellow]Step 3: Vocal Separation[/bold yellow]"
         ))
-        
+
         cmd = [
-            "uv", "run", "demucs", 
-            "-n", "htdemucs", 
-            "--two-stems=vocals", 
+            "uv", "run", "demucs",
+            "-n", "htdemucs",
+            "--two-stems=vocals",
             str(self.audio_path)
         ]
-        
+
         subprocess.run(cmd, check=True)
-        
+
         sep_dir = Path("separated") / "htdemucs" / "audio"
-        
+
         if (sep_dir / "vocals.wav").exists():
             shutil.move(str(sep_dir / "vocals.wav"), str(self.vocals_path))
             shutil.move(str(sep_dir / "no_vocals.wav"), str(self.instrumental_path))
@@ -268,14 +278,14 @@ class KaraokePipeline:
             return
 
         self.save_status({"stage": "aligning_lyrics"})
-        
+
         console.print(Panel(
             "[bold blue]🎙 Aligning Synced Lyrics (WhisperX)...[/bold blue]\n"
             "[dim]Matching vocal recordings with lyrics text down to the word level.[/dim]",
             border_style="blue",
             title="[bold blue]Step 4: Lyric Alignment[/bold blue]"
         ))
-        
+
         # Parse LRC
         lrc_lines = self._parse_lrc(self.lrc_path)
         segments = [
@@ -287,10 +297,10 @@ class KaraokePipeline:
             audio = whisperx.load_audio(str(self.vocals_path))
             status.update("[bold blue]Initializing English alignment model...[/bold blue]")
             model_a, metadata = whisperx.load_align_model(language_code="en", device=DEVICE)
-            
+
             status.update("[bold blue]Executing millisecond-level word alignment...[/bold blue]")
             result = whisperx.align(segments, model_a, metadata, audio, DEVICE)
-        
+
         karaoke_data = []
         for segment in result["segments"]:
             words = []
@@ -303,7 +313,7 @@ class KaraokePipeline:
                     "start": round(start, 3),
                     "end": round(end, 3)
                 })
-            
+
             karaoke_data.append({
                 "line": segment["text"],
                 "start": round(segment["start"], 3),
@@ -313,14 +323,42 @@ class KaraokePipeline:
 
         with open(self.karaoke_path, "w", encoding="utf-8") as f:
             json.dump(karaoke_data, f, indent=2, ensure_ascii=False)
-        
+
         self.save_status({"aligned": True, "stage": "complete"})
-        
+
         console.print(Panel(
             f"[bold green]✓ Word-level lyric alignment successfully completed![/bold green]\n"
             f"[dim]Generated timings for [yellow]{len(karaoke_data)}[/yellow] lyric lines.[/dim]",
             border_style="green",
             title="[bold green]Step 4 Complete[/bold green]"
+        ))
+
+    def elrc_step(self):
+        if not self.karaoke_path.exists():
+            console.print("[yellow]⚠ Skipping Step 5: No aligned timing data (karaoke.json) to convert.[/yellow]")
+            return
+
+        if not ELRC_SCRIPT.exists():
+            console.print(f"[bold red]✗ Cannot find {ELRC_SCRIPT.name} next to process.py.[/bold red]")
+            return
+
+        self.save_status({"stage": "converting_elrc"})
+
+        try:
+            subprocess.run(
+                [sys.executable, str(ELRC_SCRIPT), str(self.karaoke_path), str(self.elrc_path)],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            console.print(f"[bold red]✗ ELRC conversion failed: {e}[/bold red]")
+            return
+
+        self.save_status({"elrc": True, "stage": "complete"})
+        console.print(Panel(
+            f"[bold green]✓ Enhanced LRC generated![/bold green]\n"
+            f"[yellow]File:[/yellow] {self.elrc_path.name}",
+            border_style="green",
+            title="[bold green]Step 5 Complete[/bold green]"
         ))
 
     def _parse_lrc(self, path):
@@ -332,7 +370,7 @@ class KaraokePipeline:
                 if not match: continue
                 timestamp = int(match.group(1)) * 60 + float(match.group(2))
                 lines.append({"start": timestamp, "text": match.group(3).strip()})
-        
+
         for i in range(len(lines) - 1):
             lines[i]["end"] = lines[i + 1]["start"]
         if lines:
@@ -353,6 +391,7 @@ class KaraokePipeline:
             ("Separated Vocals", self.vocals_path),
             ("Instrumental Track", self.instrumental_path),
             ("Aligned Timing Data", self.karaoke_path),
+            ("Enhanced LRC", self.elrc_path),
         ]
 
         for desc, path in files_to_check:
@@ -366,19 +405,17 @@ class KaraokePipeline:
         console.print(table)
 
 if __name__ == "__main__":
-    import sys
-    
     # Beautiful welcome header
     console.print(Panel(
         Align.center("[bold magenta]🎤 Welcome to SingAlongSync 🎤[/bold magenta]\n[cyan]Separate vocals & align word-level timings with deep-learning precision.[/cyan]"),
         border_style="magenta"
     ))
-    
+
     if len(sys.argv) > 1:
         url = sys.argv[1]
     else:
         url = console.input("[bold yellow]🔗 Enter YouTube URL:[/bold yellow] ")
-        
+
     try:
         pipeline = KaraokePipeline(url)
         pipeline.process()
