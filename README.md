@@ -71,6 +71,7 @@ downloads/<video_id>/
 ├── vocals.wav         # Demucs-separated clean vocal stem
 ├── instrumental.wav   # Demucs-separated instrumental stem
 ├── karaoke.json       # WhisperX millisecond word-level timing database
+├── audio.elrc         # Enhanced LRC output.
 └── status.json        # Pipeline stage execution log
 ```
 
